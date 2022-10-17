@@ -122,6 +122,8 @@ fn main() {
         // try_recv will return Err if the channel is closed or there's no
         // pending values in the channel buffer.
         let mut exit = false;
+        // FIXME: seems we shall use rx.recv to block on here so that each
+        // handle_connection starts with the latest upstream server states.
         match rx.try_recv() {
             Ok(dead_indexes) => {
                 log::debug!("recv dead_indexes = {:?}", dead_indexes);
