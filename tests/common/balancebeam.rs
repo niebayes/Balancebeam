@@ -27,12 +27,12 @@ impl BalanceBeam {
         let mut rng = rand::thread_rng();
         let address = format!("127.0.0.1:{}", rng.gen_range(1024, 65535));
         let mut cmd = Command::new(BalanceBeam::target_bin_path());
+        // println!("balancebeam binary path: {:?}", BalanceBeam::target_bin_path());
         cmd.arg("--bind").arg(&address);
 
-        // let upstream_command = cmd.arg("--upstream");
+        let upstream_command = cmd.arg("--upstream");
         for upstream in upstreams {
-            cmd.arg("--upstream").arg(upstream);
-            // upstream_command.arg(upstream);
+            upstream_command.arg(upstream);
         }
         if let Some(active_health_check_interval) = active_health_check_interval {
             cmd.arg("--active-health-check-interval")

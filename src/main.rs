@@ -100,13 +100,27 @@ fn main() {
 
 fn connect_to_upstream(state: &ProxyState) -> Result<TcpStream, std::io::Error> {
     let mut rng = rand::rngs::StdRng::from_entropy();
-    let upstream_idx = rng.gen_range(0, state.upstream_addresses.len());
-    let upstream_ip = &state.upstream_addresses[upstream_idx];
-    TcpStream::connect(upstream_ip).or_else(|err| {
-        log::error!("Failed to connect to upstream {}: {}", upstream_ip, err);
-        Err(err)
-    })
-    // TODO: implement failover (milestone 3)
+
+    // load balancing strategy: randomly select an available upstream server.
+
+    // collect all upstream addresses as candidates to this dispatch.
+    let mut candidates: Vec<_> = state.upstream_addresses.iter().collect();
+    // loop inv: there're candidates to be examined.
+    while !candidates.is_empty() {
+        // randomly select a candidate.
+        let idx = rng.gen_range(0, candidates.len());
+        let upstream_ip = candidates.remove(idx);
+        // if it's okay to connect with it, return the connection stream.
+        // otherwise, try to examine another candidate.
+        if let Ok(stream) = TcpStream::connect(upstream_ip) {
+            return Ok(stream);
+        }
+    }
+    // post cond: all candidates are examined and no one is selected.
+    log::error!("All upstream servers are dead currently");
+    // FIXME: don't know how to set the io::Error, so I just temporarily use a foo error.
+    let foo_err = std::io::Error::from_raw_os_error(22);
+    Err(foo_err)
 }
 
 fn send_response(client_conn: &mut TcpStream, response: &http::Response<Vec<u8>>) {
