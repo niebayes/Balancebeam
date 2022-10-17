@@ -67,6 +67,14 @@ struct ProxyState {
     dead_indexes: Vec<usize>,
 }
 
+// balancebeam::setup will executes the binary compiled from this file to
+// start up a balancebeam instance.
+// the test suites will also start up several echo server instances which act as
+// the upstream/application servers.
+// the test suites than send mock client requests to the balancebeam and let it
+// forwards the requests to one of the echo servers.
+// when the balancebeam receives reponses from an echo server, it forwards them
+// back to the client, i.e. one of the test suites.
 fn main() {
     // Initialize the logging library. You can print log messages using the `log` macros:
     // https://docs.rs/log/0.4.8/log/ You are welcome to continue using print! statements; this
