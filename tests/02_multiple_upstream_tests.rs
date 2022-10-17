@@ -98,6 +98,11 @@ async fn try_failover(balancebeam: &BalanceBeam, upstreams: &mut Vec<Box<dyn Ser
     log::info!("Killing one of the upstream servers");
     upstreams.pop().unwrap().stop().await;
 
+    // FIXME: it seems not doing this wait will let the main thread starves the active
+    // health check thread and the checking logic is not installed.
+    log::info!("Waiting a few seconds for the active health check to run...");
+    delay_for(Duration::from_secs(3)).await;
+
     // Make sure requests continue to work
     for i in 0..6 {
         log::info!("Sending request #{} after killing an upstream server", i);
