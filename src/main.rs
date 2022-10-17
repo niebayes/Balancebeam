@@ -26,9 +26,9 @@ struct CmdOptions {
     )]
     active_health_check_interval: usize,
     #[clap(
-    long,
-    about = "Path to send request to for active health checks",
-    default_value = "/"
+        long,
+        about = "Path to send request to for active health checks",
+        default_value = "/"
     )]
     active_health_check_path: String,
     #[clap(
@@ -125,7 +125,11 @@ fn connect_to_upstream(state: &ProxyState) -> Result<TcpStream, std::io::Error> 
 
 fn send_response(client_conn: &mut TcpStream, response: &http::Response<Vec<u8>>) {
     let client_ip = client_conn.peer_addr().unwrap().ip().to_string();
-    log::info!("{} <- {}", client_ip, response::format_response_line(&response));
+    log::info!(
+        "{} <- {}",
+        client_ip,
+        response::format_response_line(&response)
+    );
     if let Err(error) = response::write_to_stream(&response, client_conn) {
         log::warn!("Failed to send response to client: {}", error);
         return;
@@ -187,11 +191,18 @@ fn handle_connection(mut client_conn: TcpStream, state: &ProxyState) {
         // Add X-Forwarded-For header so that the upstream server knows the client's IP address.
         // (We're the ones connecting directly to the upstream server, so without this header, the
         // upstream server will only know our IP, not the client's.)
+        // The X-Forwarded-For (XFF) HTTP header field is a common method for identifying
+        // the originating IP address of a client connecting to a web server through an
+        // HTTP proxy or load balancer.
         request::extend_header_value(&mut request, "x-forwarded-for", &client_ip);
 
         // Forward the request to the server
         if let Err(error) = request::write_to_stream(&request, &mut upstream_conn) {
-            log::error!("Failed to send request to upstream {}: {}", upstream_ip, error);
+            log::error!(
+                "Failed to send request to upstream {}: {}",
+                upstream_ip,
+                error
+            );
             let response = response::make_http_error(http::StatusCode::BAD_GATEWAY);
             send_response(&mut client_conn, &response);
             return;
