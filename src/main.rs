@@ -1,13 +1,16 @@
+mod rate_limit_check;
 mod request;
 mod response;
 
 use clap::Parser;
 use rand::{Rng, SeedableRng};
+use rate_limit_check::WindowTracker;
 use std::collections::HashSet;
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{self, TryRecvError};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time;
+use threadpool::ThreadPool;
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
@@ -48,8 +51,7 @@ struct CmdOptions {
 /// to, what servers have failed, rate limiting counts, etc.)
 ///
 /// You should add fields to this struct in later milestones.
-#[derive(Clone)]
-struct ProxyState {
+pub struct ProxyState {
     /// How frequently we check whether upstream servers are alive (Milestone 4)
     #[allow(dead_code)]
     active_health_check_interval: usize,
@@ -58,12 +60,23 @@ struct ProxyState {
     active_health_check_path: String,
     /// Maximum number of requests an individual IP can make in a minute (Milestone 5)
     #[allow(dead_code)]
-    max_requests_per_minute: usize,
+    max_request_rate: usize,
     /// Addresses of servers that we are proxying to
     upstream_addresses: Vec<String>,
-    /// Indexes of dead servers.
-    dead_indexes: Vec<usize>,
+    /// Status of upstream servers. True if the corresponding server is alive.
+    upstream_status: RwLock<Vec<bool>>,
+    /// Sliding window tracker for the sliding window rate limiting algorithm.
+    window_tracker: Mutex<WindowTracker>,
 }
+
+// window size of the sliding window rate limiting algorithm.
+// i.e. the length of a time bucket.
+const WINDOW_SIZE: u64 = 60;
+// invoke the sliding_window_ticker every TICK_INTERVAL secs
+// to slide the window to the current timestamp.
+const TICK_INTERVAL: usize = 1;
+// size of the thread pool.
+const NUM_THREADS: usize = 4;
 
 // balancebeam::setup will executes the binary compiled from this file to
 // start up a balancebeam instance.
@@ -100,144 +113,62 @@ fn main() {
     log::info!("Listening for requests on {}", options.bind);
 
     // Handle incoming connections
-    let mut state = ProxyState {
-        upstream_addresses: options.upstream,
+    let state = ProxyState {
+        // dynamic fields.
+        upstream_status: RwLock::new(vec![true; options.upstream.len()]),
+        window_tracker: Mutex::new(WindowTracker::new(WINDOW_SIZE)),
+        // static fields.
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
-        max_requests_per_minute: options.max_requests_per_minute,
-        dead_indexes: Vec::new(),
+        max_request_rate: options.max_requests_per_minute,
+        upstream_addresses: options.upstream,
     };
+    // each thread shares the single state instance.
+    let state = Arc::new(state);
 
-    // create a channel for message passing between the main thread and the active health check thread.
-    let (tx, rx) = mpsc::channel();
-    // we want the thread not interfer with the main thread, so we clone the state and
-    // move it into this thread.
-    let state_clone = state.to_owned();
-    // spawn a thread doing active health check periodically.
-    thread::spawn(move || active_health_check(state_clone, tx));
+    // spawn a thread to do active health check periodically.
+    let shared_state = state.clone();
+    thread::spawn(move || active_health_check(shared_state));
 
-    // creates time buckets for sliding window rate limiting.
-    let mut last_bucket_counter = BucketCounter {
-        num_requests: 0,
-        // actually no need to init this field for the last_bucket_counter.
-        start_time: time::Instant::now(),
-    };
-    let mut curr_bucket_counter = BucketCounter {
-        num_requests: 0,
-        start_time: time::Instant::now(),
-    };
+    // no need to do rate limiting if max request rate is 0.
+    if state.max_request_rate > 0 {
+        let shared_state = state.clone();
+        // spawn a thread to slide the window periodically.
+        thread::spawn(move || {
+            rate_limit_check::sliding_window_ticker(shared_state.clone(), TICK_INTERVAL)
+        });
+    }
+
+    // create a thread pool to handle connections.
+    let thread_pool = ThreadPool::new(NUM_THREADS);
 
     for stream in listener.incoming() {
-        if stream.is_err() {
-            log::debug!("incoming error stream");
-            continue;
+        if let Ok(stream) = stream {
+            // Handle the connection!
+            // dispatch this job to an idle worker in the thread pool.
+            // if there's no idle workers currently, the job is pushed
+            // into the waiting queue and might be scheduled when a worker
+            // becomes idle.
+            let shared_state = state.clone();
+            thread_pool.execute(move || handle_connection(stream, shared_state.clone()));
         }
-        let stream = stream.unwrap();
-
-        // try_recv will return Err if the channel is closed or there's no
-        // pending values in the channel buffer.
-        let mut exit = false;
-        // FIXME: seems we shall use rx.recv to block on here so that each
-        // handle_connection starts with the latest upstream server states.
-        match rx.try_recv() {
-            Ok(dead_indexes) => {
-                log::debug!("recv dead_indexes = {:?}", dead_indexes);
-                state.dead_indexes = dead_indexes;
-            }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                log::info!("channel closed");
-                exit = true;
-            }
-        }
-        if exit {
-            break;
-        }
-
-        // Handle the connection!
-        handle_connection(
-            stream,
-            &state,
-            &mut last_bucket_counter,
-            &mut curr_bucket_counter,
-        );
     }
 }
 
-// window size of the sliding window rate limiting algorithm.
-const WINDOW_SIZE: time::Duration = time::Duration::from_secs(60);
-
-// the counter for a time bucket.
-// each time bucket is of length window_size.
-struct BucketCounter {
-    num_requests: u32,         // #requests received in this bucket.
-    start_time: time::Instant, // the start time of this bucket.
-}
-
-// return true if adding a new request would not exceed the rate limit.
-// return false otherwise.
-fn rate_limit_check(
-    last_bucket_counter: &mut BucketCounter,
-    curr_bucket_counter: &mut BucketCounter,
-    max_request_rate: usize,
-) -> bool {
-    // check if we run into a new time bucket.
-    let now = time::Instant::now();
-    if now.duration_since(curr_bucket_counter.start_time) > WINDOW_SIZE {
-        // slide window: replace the last bucket with the current one, and reset the current bucket.
-        last_bucket_counter.num_requests = curr_bucket_counter.num_requests;
-        last_bucket_counter.start_time = curr_bucket_counter.start_time; // unnecessary for setting this.
-
-        curr_bucket_counter.num_requests = 0;
-        curr_bucket_counter.start_time = now;
-
-        log::debug!("slide window by one time bucket");
-    }
-
-    // weights the current time bucket and the last time buckets according to the
-    // span of the sliding window.
-    let curr_bucket_weight = now
-        .duration_since(curr_bucket_counter.start_time)
-        .as_secs_f32()
-        / WINDOW_SIZE.as_secs_f32();
-    let last_bucket_weight = 1.0 - curr_bucket_weight;
-    log::debug!(
-        "curr_bucket_weight = {},  last_bucket_weight = {}",
-        curr_bucket_weight,
-        last_bucket_weight
-    );
-
-    // compute the request rate, i.e. #requests in the sliding window of length window_size.
-    // note, since this time bucket is not over, this means we've already taken into account
-    // the sliding window span of the current time bucket. So there's no need to multiply
-    // the curr_bucket_weight with curr_bucket_counter.num_requests.
-    let request_rate = (last_bucket_weight * last_bucket_counter.num_requests as f32).floor()
-        as u32
-        + curr_bucket_counter.num_requests;
-    log::debug!(
-        "request_rate = {},  max_request_rate = {}",
-        request_rate,
-        max_request_rate
-    );
-
-    // pass the rate limit check if the current request rate plus the to-be-accepted request is not greater than the max request rate.
-    request_rate + 1 <= max_request_rate as u32
-}
-
-fn active_health_check(state: ProxyState, tx: mpsc::Sender<Vec<usize>>) {
-    log::info!("start active health check thread");
+fn active_health_check(state: Arc<ProxyState>) {
+    log::debug!("start active health check thread");
 
     let check_interval = time::Duration::from_secs(state.active_health_check_interval as u64);
-    let mut last_check_time = time::Instant::now();
 
     // this thread runs in an infinite loop and exits when the main thread exits.
     loop {
         // do active health check by sending a request to the active health check path of each
         // application server. If it responds with 200 status, the application server is alive.
         // Otherwise, we assume it's dead.
+        let last_check_time = time::Instant::now();
 
         // the indexes of the dead upstream servers in the state.upstream_addresses array.
-        let mut dead_indexes = Vec::new();
+        let mut dead_indexes = HashSet::new();
 
         for (i, ip) in state.upstream_addresses.iter().enumerate() {
             if let Ok(mut stream) = TcpStream::connect(ip) {
@@ -254,7 +185,7 @@ fn active_health_check(state: ProxyState, tx: mpsc::Sender<Vec<usize>>) {
                 // send the active health check request to the upstream server through the stream.
                 if let Err(err) = request::write_to_stream(&request, &mut stream) {
                     log::error!("encounters error {} when writing to stream connected with upstream server {}", err.to_string(), i);
-                    dead_indexes.push(i);
+                    dead_indexes.insert(i);
                     continue;
                 }
 
@@ -266,7 +197,7 @@ fn active_health_check(state: ProxyState, tx: mpsc::Sender<Vec<usize>>) {
                         // we assume the application server is currently unable to serve the
                         // requests. So we mark it as dead.
                         if response.status().as_u16() != 200 {
-                            dead_indexes.push(i);
+                            dead_indexes.insert(i);
                         }
                         // although the test suite says that it replaces a good server with
                         // a server only returns status 500, it seems we cannot successfully
@@ -280,7 +211,7 @@ fn active_health_check(state: ProxyState, tx: mpsc::Sender<Vec<usize>>) {
                     }
                     Err(_) => {
                         log::error!("encounters error when writing to stream connected with upstream server {}", i);
-                        dead_indexes.push(i);
+                        dead_indexes.insert(i);
                     }
                 }
                 // the stream is closed when leaving this scope.
@@ -289,28 +220,42 @@ fn active_health_check(state: ProxyState, tx: mpsc::Sender<Vec<usize>>) {
                     "unable to establish a connection with the upstream server {}",
                     i
                 );
-                dead_indexes.push(i);
+                dead_indexes.insert(i);
             }
         }
 
-        // send to the main thread the dead indexes.
-        log::debug!("send dead_indexes = {:?}", dead_indexes);
-        if let Err(err) = tx.send(dead_indexes) {
-            log::error!("active health check thread exits with error {}", err);
-            break;
+        // update upstream server status according to the collected dead indexes.
+        // create a critical section to invoke the lock's RAII.
+        {
+            let mut status = state.upstream_status.write().unwrap();
+            for (i, alive) in status.iter_mut().enumerate() {
+                if dead_indexes.contains(&i) {
+                    *alive = false;
+                } else {
+                    *alive = true;
+                }
+            }
         }
 
         // start a new check round if timeouts.
         // I think we cannot simply use thread::sleep(check_interval) since this thread may be woken up
-        // for some reasons. So I apply a while loop to ensure at least check_inverval time has passed
-        // since the last round of health check.
+        // for some reasons (??). So I apply a while loop to ensure that at least check_inverval time
+        // has passed since the last round of health check.
         while let Some(remaining_time) = check_interval.checked_sub(last_check_time.elapsed()) {
             thread::sleep(remaining_time);
         }
-        // update last check time.
-        last_check_time = time::Instant::now();
     }
-    log::info!("active health check thread exits normally");
+}
+
+fn collect_alive_servers(state: &ProxyState) -> Vec<&String> {
+    let status = state.upstream_status.read().unwrap();
+    let mut candidates = Vec::new();
+    for (i, ip) in state.upstream_addresses.iter().enumerate() {
+        if *status.get(i).unwrap() == true {
+            candidates.push(ip);
+        }
+    }
+    candidates
 }
 
 fn connect_to_upstream(state: &ProxyState) -> Result<TcpStream, std::io::Error> {
@@ -319,13 +264,7 @@ fn connect_to_upstream(state: &ProxyState) -> Result<TcpStream, std::io::Error> 
     // load balancing strategy: randomly select an available upstream server.
 
     // collect all alive upstream addresses as candidates to this dispatch.
-    let dead_indexes: HashSet<_> = state.dead_indexes.iter().collect();
-    let mut candidates = Vec::new();
-    for (i, ip) in state.upstream_addresses.iter().enumerate() {
-        if !dead_indexes.contains(&i) {
-            candidates.push(ip);
-        }
-    }
+    let mut candidates = collect_alive_servers(state);
     log::debug!("candidates = {:?}", candidates);
 
     // loop inv: there're candidates to be examined.
@@ -359,17 +298,12 @@ fn send_response(client_conn: &mut TcpStream, response: &http::Response<Vec<u8>>
     }
 }
 
-fn handle_connection(
-    mut client_conn: TcpStream,
-    state: &ProxyState,
-    last_bucket_counter: &mut BucketCounter,
-    curr_bucket_counter: &mut BucketCounter,
-) {
+fn handle_connection(mut client_conn: TcpStream, state: Arc<ProxyState>) {
     let client_ip = client_conn.peer_addr().unwrap().ip().to_string();
     log::info!("Connection received from {}", client_ip);
 
     // Open a connection to a random destination server
-    let mut upstream_conn = match connect_to_upstream(state) {
+    let mut upstream_conn = match connect_to_upstream(state.as_ref()) {
         Ok(stream) => stream,
         Err(_error) => {
             let response = response::make_http_error(http::StatusCode::BAD_GATEWAY);
@@ -424,33 +358,28 @@ fn handle_connection(
         // HTTP proxy or load balancer.
         request::extend_header_value(&mut request, "x-forwarded-for", &client_ip);
 
-        // do rate limiting only if the max_requests_per_minute is greater than 0.
-        // if processing this request would exceed the rate limit, refuse to
-        // proxy it to the upstream server.
-        if state.max_requests_per_minute > 0
-            && !rate_limit_check(
-                last_bucket_counter,
-                curr_bucket_counter,
-                state.max_requests_per_minute,
-            )
-        {
-            log::debug!("rate limit check fails");
+        // do rate limiting only if the max_request_rate is greater than 0.
+        if state.max_request_rate > 0 {
+            // if exceeds the limited request rate, i.e. processing this request would exceed the rate limit, refuse to
+            // proxy it to the upstream server.
+            let mut window_tracker = state.window_tracker.lock().unwrap();
+            if !window_tracker.rate_limit_check(state.as_ref()) {
+                // refuse this request.
+                log::debug!("rate limit check fails");
 
-            // send a response to the client to tell it's refused due to
-            // too many requests.
-            let response = response::make_http_error(http::StatusCode::TOO_MANY_REQUESTS);
-            if let Err(err) = response::write_to_stream(&response, &mut client_conn) {
-                log::error!("encounters error {:?} when writing to stream", err);
+                // send a response to the client to tell this request is refused due to
+                // too many requests.
+                let response = response::make_http_error(http::StatusCode::TOO_MANY_REQUESTS);
+                if let Err(err) = response::write_to_stream(&response, &mut client_conn) {
+                    log::error!("encounters error {:?} when writing to stream", err);
+                }
+                break;
             }
-            break;
-        }
-        // update num_requests only rate limiting is on.
-        if state.max_requests_per_minute > 0 {
             // accept this request.
-            curr_bucket_counter.num_requests += 1;
+            window_tracker.incre_counter();
             log::debug!(
-                "#requests in the current time bucket = {}",
-                curr_bucket_counter.num_requests
+                "curr_bucket_counter = {}",
+                window_tracker.curr_bucket_counter
             );
         }
 
