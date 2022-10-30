@@ -68,7 +68,7 @@ pub struct ProxyState {
     /// Sliding window tracker for the sliding window rate limiting algorithm.
     window_tracker: Mutex<WindowTracker>,
     /// Alive connection tracker for the Power of Two Random Choices load balancing algorithm.
-    alive_conns: RwLock<HashMap<String, usize>>,
+    alive_conns: Mutex<HashMap<String, usize>>,
 }
 
 // window size of the sliding window rate limiting algorithm.
@@ -125,7 +125,7 @@ fn main() {
         // dynamic fields.
         upstream_status: RwLock::new(vec![true; options.upstream.len()]),
         window_tracker: Mutex::new(WindowTracker::new(WINDOW_SIZE)),
-        alive_conns: RwLock::new(HashMap::new()),
+        alive_conns: Mutex::new(HashMap::new()),
         // static fields.
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
@@ -301,7 +301,7 @@ fn connect_to_upstream(state: &ProxyState) -> Result<TcpStream, std::io::Error> 
             upstream_addrs.push(candidates.remove(idx));
         }
         // select the one with lower #alive connections.
-        let mut alive_conns = state.alive_conns.write().unwrap();
+        let mut alive_conns = state.alive_conns.lock().unwrap();
         let cnt0 = alive_conns.get_mut(upstream_addrs[0]).unwrap();
         let cnt1 = alive_conns.get_mut(upstream_addrs[1]).unwrap();
         if cnt0 <= cnt1 {
@@ -338,7 +338,7 @@ fn connect_to_upstream(state: &ProxyState) -> Result<TcpStream, std::io::Error> 
         if let Ok(stream) = TcpStream::connect(addr) {
             // successfully connected with the only one candidate.
             // increment #alive connections.
-            let mut alive_conns = state.alive_conns.write().unwrap();
+            let mut alive_conns = state.alive_conns.lock().unwrap();
             let cnt = alive_conns.get_mut(addr).unwrap();
             *cnt += 1;
             return Ok(stream);
@@ -473,4 +473,10 @@ fn handle_connection(mut client_conn: TcpStream, state: Arc<ProxyState>) {
         send_response(&mut client_conn, &response);
         log::debug!("Forwarded response to client");
     }
+
+    // the connection ends, decrement #alive connections.
+    let mut alive_conns = state.alive_conns.lock().unwrap();
+    let cnt = alive_conns.get_mut(&upstream_ip).unwrap();
+    *cnt -= 1;
+    assert!(cnt >= &mut 0);
 }
