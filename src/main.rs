@@ -2,8 +2,10 @@ mod active_health_check;
 mod cache;
 mod load_balancing;
 mod rate_limit_check;
+mod connection_pool;
 mod request;
 mod response;
+mod cache_replacer;
 
 use active_health_check::active_health_check;
 use clap::Parser;
