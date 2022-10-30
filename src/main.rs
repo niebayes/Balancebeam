@@ -134,23 +134,26 @@ fn main() {
     if state.max_request_rate > 0 {
         let shared_state = state.clone();
         // spawn a thread to slide the window periodically.
-        thread::spawn(move || {
-            rate_limit_check::sliding_window_ticker(shared_state.clone(), TICK_INTERVAL)
-        });
+        thread::spawn(move || rate_limit_check::sliding_window_ticker(shared_state, TICK_INTERVAL));
     }
 
     // create a thread pool to handle connections.
-    let thread_pool = ThreadPool::new(NUM_THREADS);
+    let _thread_pool = ThreadPool::new(NUM_THREADS);
 
     for stream in listener.incoming() {
         if let Ok(stream) = stream {
+            log::debug!("start handle a connection");
+
             // Handle the connection!
             // dispatch this job to an idle worker in the thread pool.
             // if there's no idle workers currently, the job is pushed
             // into the waiting queue and might be scheduled when a worker
             // becomes idle.
             let shared_state = state.clone();
-            thread_pool.execute(move || handle_connection(stream, shared_state.clone()));
+            // thread_pool.execute(move || handle_connection(stream, shared_state));
+            handle_connection(stream, shared_state);
+        } else {
+            log::debug!("error in the incoming stream");
         }
     }
 }
@@ -193,7 +196,7 @@ fn active_health_check(state: Arc<ProxyState>) {
                 // read_from_stream will block until a valid response is read completely.
                 match response::read_from_stream(&mut stream, &http::Method::HEAD) {
                     Ok(response) => {
-                        // if the server responds with a status code which not the expected 200,
+                        // if the server responds with a status code which is not the expected 200,
                         // we assume the application server is currently unable to serve the
                         // requests. So we mark it as dead.
                         if response.status().as_u16() != 200 {
@@ -204,7 +207,7 @@ fn active_health_check(state: Arc<ProxyState>) {
                         // establish a connection with this new server and hence the only possible
                         // status code we receive at here is 200, aka. OK.
                         log::debug!(
-                            "upstream server {} returns status {}",
+                            "active health check: server {} returns status {}",
                             ip,
                             response.status().as_u16()
                         );
@@ -227,6 +230,7 @@ fn active_health_check(state: Arc<ProxyState>) {
         // update upstream server status according to the collected dead indexes.
         // create a critical section to invoke the lock's RAII.
         {
+            log::debug!("dead_indexes = {:?}", dead_indexes);
             let mut status = state.upstream_status.write().unwrap();
             for (i, alive) in status.iter_mut().enumerate() {
                 if dead_indexes.contains(&i) {
@@ -236,10 +240,11 @@ fn active_health_check(state: Arc<ProxyState>) {
                 }
             }
         }
+        log::debug!("successfully updated the status");
 
         // start a new check round if timeouts.
         // I think we cannot simply use thread::sleep(check_interval) since this thread may be woken up
-        // for some reasons (??). So I apply a while loop to ensure that at least check_inverval time
+        // for some unknown reasons (??). So I apply a while loop to ensure that at least check_inverval time
         // has passed since the last round of health check.
         while let Some(remaining_time) = check_interval.checked_sub(last_check_time.elapsed()) {
             thread::sleep(remaining_time);
