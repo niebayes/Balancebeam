@@ -5,7 +5,7 @@ mod response;
 use clap::Parser;
 use rand::{Rng, SeedableRng};
 use rate_limit_check::WindowTracker;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -67,6 +67,8 @@ pub struct ProxyState {
     upstream_status: RwLock<Vec<bool>>,
     /// Sliding window tracker for the sliding window rate limiting algorithm.
     window_tracker: Mutex<WindowTracker>,
+    /// Alive connection tracker for the Power of Two Random Choices load balancing algorithm.
+    alive_conns: RwLock<HashMap<String, usize>>,
 }
 
 // window size of the sliding window rate limiting algorithm.
@@ -112,11 +114,18 @@ fn main() {
     };
     log::info!("Listening for requests on {}", options.bind);
 
-    // Handle incoming connections
+    // init alive connections mapping.
+    let mut alive_conns = HashMap::new();
+    for addr in options.upstream.iter() {
+        alive_conns.insert(addr.clone(), 0);
+    }
+
+    // to represent the state of the proxy/load balancer.
     let state = ProxyState {
         // dynamic fields.
         upstream_status: RwLock::new(vec![true; options.upstream.len()]),
         window_tracker: Mutex::new(WindowTracker::new(WINDOW_SIZE)),
+        alive_conns: RwLock::new(HashMap::new()),
         // static fields.
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
@@ -140,6 +149,8 @@ fn main() {
     // create a thread pool to handle connections.
     let _thread_pool = ThreadPool::new(NUM_THREADS);
 
+    // note, it seems the tcp lib is not compatible with mac OS and hence you have to
+    // run this program in linux to make it work.
     for stream in listener.incoming() {
         if let Ok(stream) = stream {
             log::debug!("start handle a connection");
@@ -264,29 +275,76 @@ fn collect_alive_servers(state: &ProxyState) -> Vec<&String> {
 }
 
 fn connect_to_upstream(state: &ProxyState) -> Result<TcpStream, std::io::Error> {
+    // FIXME: don't know how to set the io::Error, so I just temporarily use a foo error.
+    let foo_err = std::io::Error::from_raw_os_error(22);
+
+    // randome number generator.
     let mut rng = rand::rngs::StdRng::from_entropy();
 
-    // load balancing strategy: randomly select an available upstream server.
-
     // collect all alive upstream addresses as candidates to this dispatch.
+    // active health check works on here
     let mut candidates = collect_alive_servers(state);
     log::debug!("candidates = {:?}", candidates);
 
-    // loop inv: there're candidates to be examined.
-    while !candidates.is_empty() {
-        // randomly select a candidate.
-        let idx = rng.gen_range(0, candidates.len());
-        let upstream_ip = candidates.remove(idx);
-        // if it's okay to connect with it, return the connection stream.
-        // otherwise, try to examine another candidate.
-        if let Ok(stream) = TcpStream::connect(upstream_ip) {
+    // Power of Two Random Choices load balancing algorithm.
+    // repeatedly randomly choose two alive upstream servers, first try to connect with
+    // the one with lower #alive connections, then try to connect with the other one.
+    // if neither of the two can be connected, try to select another randome two.
+
+    // loop inv: there're at least two candidates to be examined.
+    while candidates.len() >= 2 {
+        // randomly choose two candidates.
+        let mut upstream_addrs = Vec::new();
+        for _ in 0..2 {
+            // randomly choose one candidate.
+            let idx = rng.gen_range(0, candidates.len());
+            upstream_addrs.push(candidates.remove(idx));
+        }
+        // select the one with lower #alive connections.
+        let mut alive_conns = state.alive_conns.write().unwrap();
+        let cnt0 = alive_conns.get_mut(upstream_addrs[0]).unwrap();
+        let cnt1 = alive_conns.get_mut(upstream_addrs[1]).unwrap();
+        if cnt0 <= cnt1 {
+            // passive health check works on here, i.e. if fails to connect with one server, try another one.
+            // try to connect with the first one.
+            if let Ok(stream) = TcpStream::connect(upstream_addrs[0]) {
+                // increment #alive connections.
+                *cnt0 += 1;
+                return Ok(stream);
+            }
+            // try to connect with the second one.
+            if let Ok(stream) = TcpStream::connect(upstream_addrs[1]) {
+                // increment #alive connections.
+                *cnt1 += 1;
+                return Ok(stream);
+            }
+        } else {
+            // try to connect with the second one.
+            if let Ok(stream) = TcpStream::connect(upstream_addrs[1]) {
+                // increment #alive connections.
+                *cnt1 += 1;
+                return Ok(stream);
+            }
+            // try to connect with the first one.
+            if let Ok(stream) = TcpStream::connect(upstream_addrs[0]) {
+                // increment #alive connections.
+                *cnt0 += 1;
+                return Ok(stream);
+            }
+        }
+    }
+    // post cond: #candidates is less than 2, i.e. 1 or 0.
+    if let Some(&addr) = candidates.first() {
+        if let Ok(stream) = TcpStream::connect(addr) {
+            // successfully connected with the only one candidate.
+            // increment #alive connections.
+            let mut alive_conns = state.alive_conns.write().unwrap();
+            let cnt = alive_conns.get_mut(addr).unwrap();
+            *cnt += 1;
             return Ok(stream);
         }
     }
-    // post cond: all candidates are examined and no one is selected.
-    log::error!("All upstream servers are dead currently");
-    // FIXME: don't know how to set the io::Error, so I just temporarily use a foo error.
-    let foo_err = std::io::Error::from_raw_os_error(22);
+    // no candidates or failed to connect with the only one candidate.
     Err(foo_err)
 }
 
