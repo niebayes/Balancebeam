@@ -1,15 +1,18 @@
+mod active_health_check;
+mod cache;
+mod load_balancing;
 mod rate_limit_check;
 mod request;
 mod response;
 
+use active_health_check::active_health_check;
 use clap::Parser;
 use rand::{Rng, SeedableRng};
 use rate_limit_check::WindowTracker;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use std::time;
 use threadpool::ThreadPool;
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
@@ -169,100 +172,6 @@ fn main() {
     }
 }
 
-fn active_health_check(state: Arc<ProxyState>) {
-    log::debug!("start active health check thread");
-
-    let check_interval = time::Duration::from_secs(state.active_health_check_interval as u64);
-
-    // this thread runs in an infinite loop and exits when the main thread exits.
-    loop {
-        // do active health check by sending a request to the active health check path of each
-        // application server. If it responds with 200 status, the application server is alive.
-        // Otherwise, we assume it's dead.
-        let last_check_time = time::Instant::now();
-
-        // the indexes of the dead upstream servers in the state.upstream_addresses array.
-        let mut dead_indexes = HashSet::new();
-
-        for (i, ip) in state.upstream_addresses.iter().enumerate() {
-            if let Ok(mut stream) = TcpStream::connect(ip) {
-                // construct an active health check request.
-                // @note HTTP HEAD vs. GET methods.
-                // https://reqbin.com/Article/HttpHead
-                let request = http::Request::builder()
-                    .method("HEAD")
-                    .uri(state.active_health_check_path.as_str())
-                    .header("Host", ip.as_str())
-                    .body(Vec::new())
-                    .expect("failed to build an active health check request");
-
-                // send the active health check request to the upstream server through the stream.
-                if let Err(err) = request::write_to_stream(&request, &mut stream) {
-                    log::error!("encounters error {} when writing to stream connected with upstream server {}", err.to_string(), i);
-                    dead_indexes.insert(i);
-                    continue;
-                }
-
-                // read the response of the upstream server from the stream.
-                // read_from_stream will block until a valid response is read completely.
-                match response::read_from_stream(&mut stream, &http::Method::HEAD) {
-                    Ok(response) => {
-                        // if the server responds with a status code which is not the expected 200,
-                        // we assume the application server is currently unable to serve the
-                        // requests. So we mark it as dead.
-                        if response.status().as_u16() != 200 {
-                            dead_indexes.insert(i);
-                        }
-                        // although the test suite says that it replaces a good server with
-                        // a server only returns status 500, it seems we cannot successfully
-                        // establish a connection with this new server and hence the only possible
-                        // status code we receive at here is 200, aka. OK.
-                        log::debug!(
-                            "active health check: server {} returns status {}",
-                            ip,
-                            response.status().as_u16()
-                        );
-                    }
-                    Err(_) => {
-                        log::error!("encounters error when writing to stream connected with upstream server {}", i);
-                        dead_indexes.insert(i);
-                    }
-                }
-                // the stream is closed when leaving this scope.
-            } else {
-                log::error!(
-                    "unable to establish a connection with the upstream server {}",
-                    i
-                );
-                dead_indexes.insert(i);
-            }
-        }
-
-        // update upstream server status according to the collected dead indexes.
-        // create a critical section to invoke the lock's RAII.
-        {
-            log::debug!("dead_indexes = {:?}", dead_indexes);
-            let mut status = state.upstream_status.write().unwrap();
-            for (i, alive) in status.iter_mut().enumerate() {
-                if dead_indexes.contains(&i) {
-                    *alive = false;
-                } else {
-                    *alive = true;
-                }
-            }
-        }
-        log::debug!("successfully updated the status");
-
-        // start a new check round if timeouts.
-        // I think we cannot simply use thread::sleep(check_interval) since this thread may be woken up
-        // for some unknown reasons (??). So I apply a while loop to ensure that at least check_inverval time
-        // has passed since the last round of health check.
-        while let Some(remaining_time) = check_interval.checked_sub(last_check_time.elapsed()) {
-            thread::sleep(remaining_time);
-        }
-    }
-}
-
 fn collect_alive_servers(state: &ProxyState) -> Vec<&String> {
     let status = state.upstream_status.read().unwrap();
     let mut candidates = Vec::new();
@@ -275,77 +184,13 @@ fn collect_alive_servers(state: &ProxyState) -> Vec<&String> {
 }
 
 fn connect_to_upstream(state: &ProxyState) -> Result<TcpStream, std::io::Error> {
-    // FIXME: don't know how to set the io::Error, so I just temporarily use a foo error.
-    let foo_err = std::io::Error::from_raw_os_error(22);
-
-    // randome number generator.
-    let mut rng = rand::rngs::StdRng::from_entropy();
-
     // collect all alive upstream addresses as candidates to this dispatch.
     // active health check works on here
     let mut candidates = collect_alive_servers(state);
     log::debug!("candidates = {:?}", candidates);
 
-    // Power of Two Random Choices load balancing algorithm.
-    // repeatedly randomly choose two alive upstream servers, first try to connect with
-    // the one with lower #alive connections, then try to connect with the other one.
-    // if neither of the two can be connected, try to select another randome two.
-
-    // loop inv: there're at least two candidates to be examined.
-    while candidates.len() >= 2 {
-        // randomly choose two candidates.
-        let mut upstream_addrs = Vec::new();
-        for _ in 0..2 {
-            // randomly choose one candidate.
-            let idx = rng.gen_range(0, candidates.len());
-            upstream_addrs.push(candidates.remove(idx));
-        }
-        // select the one with lower #alive connections.
-        let mut alive_conns = state.alive_conns.lock().unwrap();
-        let cnt0 = alive_conns.get_mut(upstream_addrs[0]).unwrap();
-        let cnt1 = alive_conns.get_mut(upstream_addrs[1]).unwrap();
-        if cnt0 <= cnt1 {
-            // passive health check works on here, i.e. if fails to connect with one server, try another one.
-            // try to connect with the first one.
-            if let Ok(stream) = TcpStream::connect(upstream_addrs[0]) {
-                // increment #alive connections.
-                *cnt0 += 1;
-                return Ok(stream);
-            }
-            // try to connect with the second one.
-            if let Ok(stream) = TcpStream::connect(upstream_addrs[1]) {
-                // increment #alive connections.
-                *cnt1 += 1;
-                return Ok(stream);
-            }
-        } else {
-            // try to connect with the second one.
-            if let Ok(stream) = TcpStream::connect(upstream_addrs[1]) {
-                // increment #alive connections.
-                *cnt1 += 1;
-                return Ok(stream);
-            }
-            // try to connect with the first one.
-            if let Ok(stream) = TcpStream::connect(upstream_addrs[0]) {
-                // increment #alive connections.
-                *cnt0 += 1;
-                return Ok(stream);
-            }
-        }
-    }
-    // post cond: #candidates is less than 2, i.e. 1 or 0.
-    if let Some(&addr) = candidates.first() {
-        if let Ok(stream) = TcpStream::connect(addr) {
-            // successfully connected with the only one candidate.
-            // increment #alive connections.
-            let mut alive_conns = state.alive_conns.lock().unwrap();
-            let cnt = alive_conns.get_mut(addr).unwrap();
-            *cnt += 1;
-            return Ok(stream);
-        }
-    }
-    // no candidates or failed to connect with the only one candidate.
-    Err(foo_err)
+    // select an upstream to handle the connection.
+    load_balancing::select_upstream(state, &mut candidates)
 }
 
 fn send_response(client_conn: &mut TcpStream, response: &http::Response<Vec<u8>>) {
